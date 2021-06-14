@@ -1,0 +1,425 @@
+---
+title: "Australian Property Prices Dashboard"
+output:
+  flexdashboard::flex_dashboard:
+    source_code: embed
+    orientation: rows
+    theme: yeti
+  runtime: shiny
+---
+
+```{r global, include=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = FALSE, results = "asis")
+
+library(flexdashboard)
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(maps)
+library(ggplot2)
+library(ggthemes)
+library(plotly)
+library(tools) 
+library(shiny)
+library(psych)
+library(gganimate)
+library(broom)
+library(leaflet)
+
+
+knitr::write_bib(c(.packages()), "./inst/packages.bib")
+
+#import relevant data from sources
+HousePrices <- read_excel("./data/641604.xls", sheet = "Data1", col_types = c("numeric"))
+
+BuildingApprovals <- read_csv("./data/87520_activity.csv")
+```
+
+# Introduction
+
+## Row
+
+### Welcome
+
+Over the past 10 years house prices have been booming in Australia and there has been a lot of media interest in the current market cycle. The purpose of this dashboard is to look back over the past 10 years to determine;
+
+1.) "Which city has had the largest median value growth percentage in residential house properties".
+
+While there are many variables that can influence house prices, I have chosen to consider the volume of new housing developments to see how this impacts prices in each capital city to answer the following:
+
+2.) "How does the volume of new residential buildings impact the median city house price in each state?"
+
+The dashboard has been built with the following features:
+
+**Capital City Prices** -- Allows you to select a date range to check the relative difference in prices median prices in each capital city. First select the date range you are interested in, then hover over the spot on the map, each spot will change size based on the relative difference in house prices.
+
+**Median House Prices** -- This tab shows that while most capital cities over the 10 year period have seen significant capital growth, there were periods where the prices were largely static and growth went backwards which highlights why it's important to carefully consider property investment as you don't always see an increase in capital in a linear fashion.
+
+**Approvals and Prices** -- Shows a scatterplot of the relationship between the percentage change in house prices and building approvals and allows you to look at each individual data point on the plot. It also contains the ability to predict a house price based on the data model with the state, starting price and percentage change in building approvals that are applied to the calculated values to show the impact to the house price in each state as the building approvals change.
+
+# Capital City Prices
+
+## Inputs {.sidebar}
+
+Please select the date range for the data you would like to see:
+
+```{r}
+
+dateRangeInput("dateRange", label = "Please select date range: yyyy-mm", format = "yyyy-mm", min = "2010-09-03", max = "2020-12-03", start = "2010-09-03", end = "2020-12-03")
+
+```
+The size of the circle on the map represents the size of the relative difference in the house prices for the period you have selected, hover over to see the actual percentage difference.
+
+## Row
+
+### Map of Australia
+
+```{r}
+
+#Add missing header, remove descriptors and convert date to standard formatting
+names(HousePrices) [1] <- "Quarter" 
+HousePrices$Quarter <- as.Date(HousePrices$Quarter, origin = "1900-01-01")
+HousePrices <- slice (HousePrices, -(1:9))  
+
+#Reduce datset to last 10 years and remove apartments from the dataset
+HousePrices10Years <- HousePrices %>% 
+  filter(Quarter >= as.Date("2010-09-03") & Quarter <= as.Date("2020-12-03")) %>%
+  select(c(1,2,4,6,8,10,12,14,16))
+
+#Cleanup the headers to make them more easily readable
+HousePrices10Years <- rename_with(HousePrices10Years, ~ tolower(gsub("Median Price of Established House Transfers (Unstratified) ;", "", .x, fixed = TRUE)))
+HousePrices10Years <- rename_with(HousePrices10Years, ~ tolower(gsub(" ;", "", .x, fixed = TRUE)))
+HousePrices10Years$quarter <- format(as.Date(HousePrices10Years$quarter, "%Y-%m-%d"), "%Y-%m")
+
+PricesForMap <- reactive({ HousePrices10Years %>%
+    filter(quarter >= format(as.Date(input$dateRange[1]), "%Y-%m") & quarter <= format(as.Date(input$dateRange[2]), "%Y-%m")) %>% 
+    pivot_wider(names_from = "City", values_from = "Amount") %>% 
+    headTail(1,1) %>% 
+    na.omit() %>% 
+    pivot_longer(!quarter, names_to = "City", values_to = "Amount") %>%
+    spread(quarter, Amount) %>% 
+    setNames( c("City", "2010", "2020")) %>%
+    subset(City != "year") %>% 
+    mutate_at(vars(-City), as.integer) %>%
+    mutate(RelativeDifference = (`2020`-`2010`)/(`2010`)*100) %>% 
+    mutate(City = recode(City, 
+                       "New.South.Wales"="Sydney", 
+                       "Victoria"="Melbourne",
+                       "South.Australia"="Adelaide",
+                       "Queensland"="Brisbane",
+                       "Western.Australia"="Perth",
+                       "Tasmania"="Hobart",
+                       "Northern.Territory"="Darwin",
+                       "Australian.Capital.Territory"="Canberra")) %>% 
+    filter(City != "month") 
+  })
+
+
+#Source the location data required to map to each city and join to the prices
+MapCities <- reactive({
+    world.cities[world.cities$country.etc == "Australia",]
+})
+
+MapPrices <- reactive({
+    PricesForMap() %>% 
+    left_join(MapCities(), by=c("City"="name"))})
+
+
+mapfunction <- reactive({
+    leaflet(MapPrices()) %>% 
+    addTiles() %>% 
+    setView(lng = 131.035431, lat = -25.344490, zoom = 4)
+    
+})
+
+#set palette for each city
+pal <- colorFactor( palette = 'Dark2', domain = c("Adelaide","Brisbane","Sydney","Melbourne","Perth","Darwin", "Hobart","Canberra"))
+
+renderLeaflet({
+mapfunction() %>% 
+    addCircleMarkers(data = MapPrices(), 
+                     lng = MapPrices()$long, 
+                     lat = MapPrices()$lat, 
+                     radius = MapPrices()$RelativeDifference *.5, 
+                     label = paste("Relative Difference %", prettyNum(MapPrices()$RelativeDifference, digits = 4)), 
+                     color = ~pal(MapPrices()$City))
+})
+
+
+#Build dataframe to house the dataset for visualisation
+names(BuildingApprovals) [2] <- "Location" 
+BuildingApprovals10Years <- BuildingApprovals %>%
+  select(`Reference Quarter`, `Type of Building`, `Location`, `Dwelling units completed (Number)`, `Sector of Ownership`) %>%
+  filter(Location != "Australia" & `Sector of Ownership` == "Private Sector" & `Type of Building` == "Houses" ) %>%
+  mutate(quarter = my(`Reference Quarter`)) %>%
+  filter(quarter >= as.Date("2010-9-03") & quarter <= as.Date("2020-12-03")) 
+
+#Prepare date for joining datasets
+BuildingApprovals10Years$quarter <- format(lubridate::parse_date_time(BuildingApprovals10Years$quarter, orders = c("%Y-%m-%d")), "%Y-%m")
+
+pricesforDisplay <- reactive({
+  PricesForMap() %>% 
+  filter(City != "month") %>% 
+  setNames( c("City", "Start Price $'000", "End Price $'000", "% Difference"))
+})
+
+```
+
+### Price Changes {data-width="250"}
+
+```{r}
+
+# format for display
+renderTable(pricesforDisplay())
+```
+
+# Median House Prices
+
+## Row
+
+### Median House Prices over the past 10 years
+
+```{r}
+
+#Pre-process the dataset to display the past 10 year data
+HousePrices10Years <- HousePrices10Years %>%
+  filter(quarter != "2010-09")  %>%
+  pivot_longer(!quarter, names_to = "City", values_to = "Amount") %>%
+  mutate(year = substr(quarter, 1, 4)) %>% 
+  mutate(month = substr(quarter,6,7))
+
+HousePrices10Years$quarter <-as.Date(with(HousePrices10Years,paste(year,month,1,sep="-")),"%Y-%m-%d")
+HousePrices10Years$City <- gsub(" ", "", HousePrices10Years$City)
+HousePrices10Years$City <- toTitleCase(HousePrices10Years$City) 
+
+#Present data
+HousePrices10YearsPlot <- HousePrices10Years %>%
+  ggplot(aes(quarter, Amount, group = City, color = City)) +
+  geom_line(alpha = 1) +
+  theme(axis.text.x = element_text(angle = 90, size = 4), 
+      axis.text.y = element_text(size = 6),
+        strip.text = element_blank()) +
+        transition_reveal(quarter)+
+    labs(title = 'Change in median property prices for: {frame_along}',
+         subtitle = 'Full graph shows data from 2010 to 2020',
+       x = "Quarter", 
+       y = "Average price $'000") 
+  
+animate(HousePrices10YearsPlot, end_pause = 30)
+```
+
+# Approvals and Prices
+
+## Row
+
+### House Price and Building Approval Changes
+
+This graph shows the correlation between house prices and building approvals, hover over each point to see the values.
+
+```{r}
+
+#Pre-process data for joining Prices and Approvals data
+HousePrices10Years <- HousePrices %>% 
+  filter(Quarter >= as.Date("2010-09-03") & Quarter <= as.Date("2020-12-03")) %>%
+  select(c(1,2,4,6,8,10,12,14,16))
+
+#Cleanup the headers to make them more easily readable
+HousePrices10Years <- rename_with(HousePrices10Years, ~ tolower(gsub("Median Price of Established House Transfers (Unstratified) ;", "", .x, fixed = TRUE)))
+HousePrices10Years <- rename_with(HousePrices10Years, ~ tolower(gsub(" ;", "", .x, fixed = TRUE)))
+HousePrices10Years$quarter <- format(HousePrices10Years$quarter, "%Y-%m")
+
+HousePrices10Years <- HousePrices10Years %>%
+  filter(quarter != "2010-09")  %>%
+  pivot_longer(!quarter, names_to = "City", values_to = "Amount") %>%
+  mutate(year = substr(quarter, 1, 4)) %>% 
+  mutate(month = substr(quarter,6,7))
+
+HousePrices10Years$City <- gsub(" ", "", HousePrices10Years$City) 
+HousePrices10Years$City <- toTitleCase(HousePrices10Years$City) 
+
+HousePrices10Years <- HousePrices10Years %>%
+  mutate(City = recode(City, 
+                       "Sydney"="New South Wales", 
+                      "Melbourne"="Victoria",
+                      "Adelaide"="South Australia",
+                       "Brisbane"="Queensland",
+                       "Perth"="Western Australia",
+                       "Hobart"="Tasmania",
+                       "Darwin"="Northern Territory",
+                       "Canberra"="Australian Capital Territory"))
+
+# Calculate the percentage difference for both measures to ensure the dataset is comparable and map it on a scatter plot
+Prices_Approvals <- left_join(BuildingApprovals10Years, HousePrices10Years, by=c("Location"="City","quarter"="quarter")) %>%
+  group_by(Location) %>%
+  mutate(pct_change_HousePrice = ((Amount/lag(Amount) - 1) * 100)) %>% 
+  mutate(pct_change_BuildingApprovals = ((`Dwelling units completed (Number)`/lag(`Dwelling units completed (Number)`) - 1) * 100)) %>%
+  ungroup() %>%
+  filter(quarter != "2010-03")
+
+HousePrice_BuildingApprovals <- ggplot(Prices_Approvals, aes(x = pct_change_HousePrice, y =  pct_change_BuildingApprovals, group = Location, colour = Location)) +
+  geom_point() +
+  labs(title = "", 
+       x = "% Change in House Prices", 
+       y = "% Change in Building Approvals")
+
+ggplotly(HousePrice_BuildingApprovals)
+
+# Check linear plots of each state
+HousePrice_BuildingApprovals_Model <- ggplot(Prices_Approvals, aes(x = pct_change_HousePrice, y =  pct_change_BuildingApprovals, group = Location, colour = Location)) +
+  geom_point() +
+  geom_smooth(method = "lm", se=FALSE) + 
+  facet_grid(rows = vars(Location)) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = .5),
+    strip.text = element_blank()) +
+  labs(title = "Linear fit for each state", 
+       x = "% Change in House Prices", 
+       y = "% Change in Building Approvals") 
+
+#Finally check for coorelation between the variables to determine influence
+Price_Model_fit = lm(pct_change_BuildingApprovals~pct_change_HousePrice+Location, data=Prices_Approvals)
+
+```
+
+### House Price Predictor {data-width="220"}
+
+Predict your house price here based on the model.
+
+First, select the starting house price:
+
+```{r}
+
+sliderInput("startPrice", "Please select your starting price:",
+    min = 0, max = 2000000, value = 500000, step = 100000)
+```
+
+Then, select the state:
+
+```{r}
+selectInput("State", label = "State",
+          choices = c("New South Wales", 
+                     "Victoria",
+                      "South Australia",
+                       "Queensland",
+                       "Western Australia",
+                       "Tasmania",
+                       "Northern Territory",
+                       "Australian Capital Territory"))
+
+```
+
+Finally, select the percentage change in building approvals:
+
+```{r}
+  sliderInput("pctChange", "Percentage Change in building approvals:",
+    min = -20, max = 20, value = 0)
+
+modelDF <- as.data.frame(summary(Price_Model_fit)$coefficients)
+
+calculationValue <- modelDF %>% 
+    select(Estimate) %>% 
+    rownames_to_column()
+
+names(calculationValue) [1] <- "State" 
+calculationValue$State <- gsub("Location", "", calculationValue$State) 
+
+stateChangeAmount <- reactive({
+  calculationValue %>% 
+    filter(State == input$State) %>% 
+    select(Estimate) 
+})
+  
+newPrice <- reactive ({
+  
+  if (input$pctChange == "0") input$startPrice else 
+  round(input$startPrice + (input$startPrice * stateChangeAmount()) * input$pctChange/100, digits = 0)
+
+})
+
+renderText({  
+  paste("Expected house price value $", prettyNum(newPrice(), big.mark = ","))
+  })
+
+```
+
+# Methodology
+
+------------------------------------------------------------------------
+
+### Methodology
+
+The data has been sourced from the Australian Bureau of Statics which houses a number of publicly available datasets.
+
+Australian Bureau of Statistics. (2020). Residential Property Price Indexes: Eight Capital Cities (December 2020). Retrieved from <https://www.abs.gov.au/statistics/economy/price-indexes-and-inflation/residential-property-price-indexes-eight-capital-cities/dec-2020/641604.xls> Australian Bureau of Statistics. (2020). Building Activity, Australia (September 2020). Retrieved from
+
+<https://www.abs.gov.au/statistics/industry/building-and-construction/building-activity-australia/sep-2020/87520_activity.xlsb> Given this data is publicly available, aggregated data and does not contain any Personally Identifiable Information there are no ethical concerns that have been considered with this dataset.
+
+When initially assessing the data the visdat package was used and fortunately for the period analysed revealed no missing data in the dataset, therefore no missing values needed to be imputed.
+
+The residential Property Price Indexes Dataset ("Prices") contains 76 observations across 61 variables, the Building Activity Dataset ("Buildings") contains 70694 observations across 27 variables. Not all this data is required for the final analysis so cleaning started by trimming down the dataset to the last 10 years as this is the comparison period and selecting only data related to unattached dwellings which represents data related to houses and not apartments. The column headers needed to be cleaned up and standardised so they could be used for future table joins. Both data sources were converted to a percentage change value to ensure we were comparing the same scales when undertaking the analysis.
+
+For the initial analysis the data needed to be wrangled to select the top and the bottom record from the dataset, which was then used to calculate the relative difference in price. To plot this on a map the latitude and longitude data was derived form the maps packaged, joined by city and then plotted along with the prices on a map generated from google maps.
+
+The whole dataset for the 10 year period was used to generate the median house price animated graphs with the gganimante package.
+
+The final step in the analysis was to combine the prices and buildings datasets and to undertake liner regression analysis to check the correlation and the impact on housing prices in each city based on the change in the percentage of building approvals, while this was ultimate a weak correlation of only 12% it did allow me to create a tool to allow user input to test this model that takes original purchase price, state and the percentage change in building approvals to generate a new value. It shows that the majority of states have a negative correlation (i.e. an increase in new buildings means a decrease in median house prices) with the biggest exception being the Northern Territory for every 1% increase in building approvals we can expect an increase in house prices of 2.2% where as Tasmania is predicted to have the biggest decrease at -1.23%.
+
+Please Note: The Buildings file needed to be manually saved to .csv due to issues with the ReadXlsb package, unfortunately I don't have access to a windows PC to use excel.link either.
+
+```{r}
+# References
+
+#The following libraries were used in this dashboard:
+
+#library(tidyverse)
+#Data wrangeling conducted using tidyverse. Wickham et al., (2019). Welcome to the tidyverse. Journal of Open Source Software, 4(43), 1686, https://doi.org/10.21105/joss.01686
+
+#library(readxl)
+#readlx used to input house price data source. Hadley Wickham and Jennifer Bryan (2019). readxl: Read Excel Files. R package version 1.3.1. https://CRAN.R-project.org/package=readxl
+
+#library(lubridate)
+#Used for date manipulation for joining datasets for analysis. Garrett Grolemund, Hadley Wickham (2011). Dates and Times Made Easy with lubridate. Journal of Statistical Software, 40(3), 1-25. URL https://www.jstatsoft.org/v40/i03/.
+
+#library(visdat)
+#Used to check for a complete dataset after manipluation. Tierney N (2017). “visdat: Visualising Whole Data Frames.” _JOSS_, *2*(16), 355. doi: 10.21105/joss.00355 (URL: https://doi.org/10.21105/joss.00355), <URL: http://dx.doi.org/10.21105/joss.00355>.
+
+#library(maps)
+#Used to gather latitude and longitude values for mapping the price increase of properties in each capital city,  Original S code by Richard A. Becker, Allan R. Wilks. R version by Ray Brownrigg. Enhancements by Thomas P Minka and Alex Deckmyn. (2018). maps: Draw Geographical Maps. R package version 3.3.0. https://CRAN.R-project.org/package=maps
+
+#library(ggplot2)
+#Used to support plotting process of data elements. H. Wickham. ggplot2: Elegant Graphics for Data Analysis. Springer-Verlag New York, 2016.
+
+#library(ggthemes)
+#Used to futher enhance readability of graphics. Jeffrey B. Arnold (2021). ggthemes: Extra Themes, Scales and Geoms for 'ggplot2'. R package version 4.2.4. https://CRAN.R-project.org/package=ggthemes
+  
+#library(ggmap)
+#Used to map price relative price increases in Australian property prices. D. Kahle and H. Wickham. ggmap: Spatial Visualization with ggplot2. The R Journal, 5(1), 144-161. URL http://journal.r-project.org/archive/2013-1/kahle-wickham.pdf
+
+#library(plotly)
+#Used to make interactive plots. C. Sievert. Interactive Web-Based Data Visualization with R, plotly, and shiny. Chapman and Hall/CRC Florida, 2020.
+
+#library(tools) 
+#Used to correct City names after transformation. R Core Team (2020). R: A language and environment for statistical computing. R Foundation for Statistical Computing, Vienna, Austria. URL https://www.R-project.org/.
+
+#library(broom)
+#Used to further extrapolate fitness on model based on Building Approvals and the relation to house price increase. David Robinson, Alex Hayes and Simon Couch (2021). broom: Convert Statistical Objects into Tidy Tibbles. R package version 0.7.6. https://CRAN.R-project.org/package=broom
+
+#library(flexdashboard)
+#Used to generate flexdashboard. Richard Iannone, JJ Allaire and Barbara Borges (2020). flexdashboard: R Markdown Format for Flexible Dashboards. R package version 0.5.2. https://CRAN.R-project.org/package=flexdashboard
+
+#library(shiny)
+#Used to generate interactive components in the dashboard. Winston Chang, Joe Cheng, JJ Allaire, Carson Sievert, Barret Schloerke, Yihui Xie, Jeff Allen, Jonathan McPherson Alan Dipert and Barbara Borges (2021). shiny: Web Application Framework for R. R package version 1.6.0. https://CRAN.R-project.org/package=shiny
+
+#library(psych)
+#Used to get first and last record in the dataset for the Australian Map. Revelle, W. (2020) psych: Procedures for Personality and Psychological Research, Northwestern University, Evanston, Illinois, USA, https://CRAN.R-project.org/package=psych Version = 2.1.3,.
+
+#library(gganimate)
+#User to animate median house price chart. Thomas Lin Pedersen and David Robinson (2020). gganimate: A Grammar of Animated Graphics. R package version 1.0.7. https://CRAN.R-project.org/package=gganimate
+
+#library(gifski)
+#Used for graph animation with gganimate. Jeroen Ooms (2021). gifski: Highest Quality GIF Encoder. R package version 1.4.3-1. https://CRAN.R-project.org/package=gifski
+
+#library(leaflet)
+#Joe Cheng, Bhaskar Karambelkar and Yihui Xie (2021). leaflet: Create Interactive Web Maps with the JavaScript 'Leaflet' Library. R package version 2.0.4.1. https://CRAN.R-project.org/package=leaflet
+
+```
